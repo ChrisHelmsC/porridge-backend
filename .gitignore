@@ -1,0 +1,55 @@
+# Dependencies
+node_modules/
+.pnp.cjs
+.pnp.data.json
+
+# Build outputs
+/dist/
+/build/
+
+# Testing / Coverage
+/coverage/
+/.nyc_output/
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# TypeScript
+*.tsbuildinfo
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+
+# Caches / temp
+.cache/
+.tmp/
+tmp/
+temp/
+
+# Multer uploads & generated assets
+uploads/
+# FFmpeg and other transient files
+/temp/
+
+# Misc
+*.pid
+*.pid.lock
+*.seed
+
+# Nest CLI cache (if used)
+.nestcache/
+
