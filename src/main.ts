@@ -1,9 +1,11 @@
 import { NestFactory } from '@nestjs/core';
 import { ValidationPipe } from '@nestjs/common';
 import { AppModule } from './app.module';
+import cookieParser from 'cookie-parser';
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule);
+  app.use(cookieParser());
   
   // Enable CORS for frontend communication
   app.enableCors({
@@ -11,7 +13,9 @@ async function bootstrap() {
       'http://localhost:3000', 
       'http://localhost:3001',
       'http://192.168.0.190:3000',  // Allow access from your IP
-      'http://192.168.0.190:3001'
+      'http://192.168.0.190:3001',
+      'http://192.168.1.81:3000',
+      'http://192.168.1.81:3001'
     ],
     credentials: true,
   });

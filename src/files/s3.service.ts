@@ -3,6 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import { S3Client, PutObjectCommand, DeleteObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import * as fs from 'fs';
+import { Upload } from '@aws-sdk/lib-storage';
 
 @Injectable()
 export class S3Service {
@@ -11,7 +12,6 @@ export class S3Service {
 
   constructor(private configService: ConfigService) {
     this.bucketName = this.configService.get<string>('AWS_S3_BUCKET') || 'porridge-files';
-    
     this.s3Client = new S3Client({
       region: this.configService.get<string>('AWS_REGION') || 'us-east-1',
       credentials: {
@@ -21,35 +21,36 @@ export class S3Service {
     });
   }
 
-  async uploadFile(filePath: string, key: string, contentType: string): Promise<string> {
+  async uploadFile(filePath: string, key: string, contentType: string, onProgress?: (uploadedBytes: number) => void): Promise<string> {
     try {
-      const fileContent = fs.readFileSync(filePath);
-
-      const command = new PutObjectCommand({
-        Bucket: this.bucketName,
-        Key: key,
-        Body: fileContent,
-        ContentType: contentType,
-        // No ACL needed - files are private and accessed via signed URLs
+      const fileStream = fs.createReadStream(filePath);
+      let uploaded = 0;
+      const uploader = new Upload({
+        client: this.s3Client,
+        params: {
+          Bucket: this.bucketName,
+          Key: key,
+          Body: fileStream,
+          ContentType: contentType,
+        },
       });
-
-      await this.s3Client.send(command);
-
-      // Return a signed URL instead of public URL
-      return await this.getSignedUrl(key, 3600); // 1 hour expiration
+      uploader.on('httpUploadProgress', (p) => { if (typeof p.loaded === 'number') { uploaded = p.loaded; onProgress && onProgress(uploaded); } });
+      await uploader.done();
+      return await this.getSignedUrl(key, 3600);
     } catch (error) {
       console.error('Error uploading file to S3:', error);
       throw new Error(`Failed to upload file to S3: ${error.message}`);
     }
   }
 
+  async getObjectStream(key: string): Promise<{ body: any; contentType?: string; contentLength?: number }> {
+    const resp = await this.s3Client.send(new GetObjectCommand({ Bucket: this.bucketName, Key: key }));
+    return { body: resp.Body as any, contentType: resp.ContentType, contentLength: resp.ContentLength };
+  }
+
   async deleteFile(key: string): Promise<void> {
     try {
-      const command = new DeleteObjectCommand({
-        Bucket: this.bucketName,
-        Key: key,
-      });
-
+      const command = new DeleteObjectCommand({ Bucket: this.bucketName, Key: key });
       await this.s3Client.send(command);
     } catch (error) {
       console.error('Error deleting file from S3:', error);
@@ -57,13 +58,13 @@ export class S3Service {
     }
   }
 
-  async getSignedUrl(key: string, expiresIn: number = 3600): Promise<string> {
+  async getSignedUrl(key: string, expiresIn: number = 3600, downloadName?: string): Promise<string> {
     try {
       const command = new GetObjectCommand({
         Bucket: this.bucketName,
         Key: key,
+        ...(downloadName ? { ResponseContentDisposition: `attachment; filename="${downloadName}"` } : {}),
       });
-
       return await getSignedUrl(this.s3Client, command, { expiresIn });
     } catch (error) {
       console.error('Error generating signed URL:', error);
@@ -71,7 +72,7 @@ export class S3Service {
     }
   }
 
-  async refreshSignedUrl(key: string, expiresIn: number = 3600): Promise<string> {
-    return await this.getSignedUrl(key, expiresIn);
+  async refreshSignedUrl(key: string, expiresIn: number = 3600, downloadName?: string): Promise<string> {
+    return await this.getSignedUrl(key, expiresIn, downloadName);
   }
 }
