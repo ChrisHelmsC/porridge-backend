@@ -147,6 +147,28 @@ export class FilesService {
     throw lastErr || new Error('Failed to fetch stream');
   }
 
+  private detectMimeFromMagic(filePath: string): { mime: string; ext: string } | null {
+    try {
+      const fd = fs.openSync(filePath, 'r');
+      const buf = Buffer.alloc(32);
+      fs.readSync(fd, buf, 0, 32, 0);
+      fs.closeSync(fd);
+      // PNG
+      if (buf.slice(0, 8).equals(Buffer.from([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]))) return { mime: 'image/png', ext: '.png' };
+      // JPEG
+      if (buf[0] === 0xFF && buf[1] === 0xD8 && buf[2] === 0xFF) return { mime: 'image/jpeg', ext: '.jpg' };
+      // GIF87a/GIF89a
+      if (buf.slice(0, 3).toString('ascii') === 'GIF') return { mime: 'image/gif', ext: '.gif' };
+      // MP4 (ftyp)
+      if (buf.slice(4, 8).toString('ascii') === 'ftyp') return { mime: 'video/mp4', ext: '.mp4' };
+      // WebM/Matroska: EBML header 1A 45 DF A3
+      if (buf[0] === 0x1A && buf[1] === 0x45 && buf[2] === 0xDF && buf[3] === 0xA3) return { mime: 'video/webm', ext: '.webm' };
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
   async backfillMissingDimensions(): Promise<{ processed: number; updated: number; errors: number }> {
     const all = await this.fileRepository.find({ order: { uploadedAt: 'DESC' } });
     let processed = 0, updated = 0, errors = 0;
@@ -273,22 +295,41 @@ export class FilesService {
 
 	async startIngestJob(url: string, ownerId: string, tags?: string[]) {
 		const jobId = uuidv4();
-		const record = { id: jobId, state: 'pending', totalBytes: 0, downloadedBytes: 0, uploadedBytes: 0, ownerId, error: null as string | null, fileId: null as string | null };
+		const record = { id: jobId, state: 'pending', totalBytes: 0, downloadedBytes: 0, uploadedBytes: 0, ownerId, error: null as string | null, fileId: null as string | null, ext: '' as string, mimeType: null as string | null, sourceUrl: url, providedUrl: url, resolvedUrl: null as string | null, finalUrl: null as string | null };
 		this.ingestJobs.set(jobId, record);
 
 		(async () => {
 			try {
 				record.state = 'resolving';
 				const mediaUrl = await this.resolveMediaUrl(url);
+				record.resolvedUrl = mediaUrl;
+				// Prefer non-silent Redgifs variant when applicable
+				let effectiveUrl = mediaUrl;
+				try {
+					const mu = new URL(effectiveUrl);
+					if (mu.hostname.toLowerCase() === 'media.redgifs.com' && /-silent\.mp4$/i.test(mu.pathname)) {
+						const nonSilent = effectiveUrl.replace(/-silent(\.mp4)$/i, '$1');
+						try {
+							const head = await axios.head(nonSilent, { timeout: 4000, headers: { 'User-Agent': 'Mozilla/5.0', Referer: 'https://www.redgifs.com/' } });
+							if (head.status >= 200 && head.status < 400) {
+								effectiveUrl = nonSilent;
+							}
+						} catch {}
+					}
+				} catch {}
+				try { record.ext = path.extname(new URL(effectiveUrl).pathname) || ''; } catch {}
 				record.state = 'downloading';
-				const politeHeaders = this.buildPoliteHeaders(mediaUrl);
-				const resp = await this.fetchStreamWithBackoff(mediaUrl, politeHeaders, 3);
+				const politeHeaders = this.buildPoliteHeaders(effectiveUrl);
+				const resp = await this.fetchStreamWithBackoff(effectiveUrl, politeHeaders, 3);
 				record.totalBytes = Number(resp.headers?.['content-length'] || 0);
+				const headerMime: string | undefined = (resp.headers?.['content-type'] as any) || undefined;
+				if (headerMime) { record.mimeType = headerMime; }
 				const tempDir = path.join(process.cwd(), 'temp'); if (!fs.existsSync(tempDir)) fs.mkdirSync(tempDir, { recursive: true });
 				const fileId = uuidv4();
-				const urlExt = path.extname(new URL(mediaUrl).pathname) || '.bin';
+				const urlExt = path.extname(new URL(effectiveUrl).pathname) || '.bin';
 				const tempFilePath = path.join(tempDir, `${fileId}${urlExt}`);
 				const writer = fs.createWriteStream(tempFilePath);
+				record.finalUrl = effectiveUrl;
 				resp.data.on('data', (chunk: Buffer) => { record.downloadedBytes += chunk.length; });
 				resp.data.pipe(writer);
 				await new Promise<void>((resolve, reject) => { writer.on('finish', () => resolve()); writer.on('error', reject); });
@@ -304,13 +345,20 @@ export class FilesService {
 				record.state = 'uploading';
 				if (!record.totalBytes) record.totalBytes = stats.size;
 
-				// Derive a sensible content-type from extension for S3 upload
-				const uploadContentType = this.getMimeTypeFromExtension(urlExt) || 'application/octet-stream';
+				// Derive a sensible content-type from extension or magic bytes
+				let uploadContentType = this.getMimeTypeFromExtension(urlExt) || record.mimeType || 'application/octet-stream';
+				if (uploadContentType === 'application/octet-stream') {
+					const sniff = this.detectMimeFromMagic(tempFilePath);
+					if (sniff) {
+						uploadContentType = sniff.mime;
+					}
+				}
+				record.mimeType = uploadContentType;
 				const s3Key = `${fileId}${urlExt}`;
 				await this.s3Service.uploadFile(tempFilePath, s3Key, uploadContentType, (bytes) => { record.uploadedBytes = bytes; });
 
 				record.state = 'saving';
-				const mockFile: Express.Multer.File = { fieldname: 'file', originalname: path.basename(new URL(mediaUrl).pathname), encoding: '7bit', mimetype: uploadContentType, size: stats.size, destination: tempDir, filename: path.basename(tempFilePath), path: tempFilePath, buffer: Buffer.alloc(0), stream: null as any };
+				const mockFile: Express.Multer.File = { fieldname: 'file', originalname: path.basename(new URL(effectiveUrl).pathname), encoding: '7bit', mimetype: uploadContentType, size: stats.size, destination: tempDir, filename: path.basename(tempFilePath), path: tempFilePath, buffer: Buffer.alloc(0), stream: null as any };
 				const saved = await this.uploadFile(mockFile, ownerId, url, tags);
 				record.fileId = saved.file.id;
 				record.state = 'done';
@@ -329,7 +377,7 @@ export class FilesService {
 	async getIngestStatus(jobId: string, ownerId: string) {
 		const rec = this.ingestJobs.get(jobId);
 		if (!rec || rec.ownerId !== ownerId) throw new Error('Job not found');
-		return { id: rec.id, state: rec.state, totalBytes: rec.totalBytes, downloadedBytes: rec.downloadedBytes, uploadedBytes: rec.uploadedBytes, fileId: rec.fileId, error: rec.error };
+		return { id: rec.id, state: rec.state, totalBytes: rec.totalBytes, downloadedBytes: rec.downloadedBytes, uploadedBytes: rec.uploadedBytes, fileId: rec.fileId, error: rec.error, ext: rec.ext, mimeType: rec.mimeType, sourceUrl: rec.sourceUrl, providedUrl: rec.providedUrl, resolvedUrl: rec.resolvedUrl, finalUrl: rec.finalUrl };
 	}
 
 	async uploadFile(file: Express.Multer.File, ownerId: string, sourceUrl?: string, tags?: string[]): Promise<{ file: FileRecord; match?: { id: string; sourceUrl?: string } }> {
@@ -619,13 +667,111 @@ export class FilesService {
 
   private async resolveMediaUrl(url: string): Promise<string> {
 		if (url.includes('redgifs.com')) {
+			// Normalize redgifs embed/watch/ifr URLs by stripping query params; prefer non-silent direct media
+			try {
+				const u = new URL(url);
+				u.search = '';
+				u.hash = '';
+				let candidate = u.toString();
+				if (u.hostname.toLowerCase() === 'media.redgifs.com' && /-silent\.mp4$/i.test(u.pathname)) {
+					const nonSilent = candidate.replace(/-silent(\.mp4)$/i, '$1');
+					try {
+						const resp = await axios.head(nonSilent, { timeout: 4000, headers: { 'User-Agent': 'Mozilla/5.0', Referer: 'https://www.redgifs.com/' } });
+						if (resp.status >= 200 && resp.status < 400) {
+							candidate = nonSilent;
+						}
+					} catch {}
+				}
+				url = candidate;
+			} catch {}
 			return await this.resolveRedgifsUrl(url);
 		}
     if (url.includes('imgur.com') && !url.endsWith('.gif') && !url.endsWith('.mp4')) {
       return await this.resolveImgurUrl(url);
     }
+    if (url.includes('reddit.com') || url.includes('redd.it')) {
+      return await this.resolveRedditUrl(url);
+    }
+		// Generic fallback: for arbitrary pages, try to discover a direct video URL
+		try {
+			return await this.resolveGenericUrl(url);
+		} catch {}
     return url;
   }
+
+  private async resolveGenericUrl(rawUrl: string): Promise<string> {
+		// If already a likely direct media URL, return as-is
+		if (/\.(mp4|webm|mov|mkv|m3u8|mpd)(\?|#|$)/i.test(rawUrl)) {
+			return rawUrl;
+		}
+		try {
+			const page = await axios.get(rawUrl, {
+				timeout: 8000,
+				headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8' },
+				maxRedirects: 5,
+				validateStatus: (s) => !!s && s < 500,
+			});
+			const html = String(page.data || '');
+			const base = new URL(page.request?.res?.responseUrl || page.request?.responseURL || rawUrl);
+
+			const absolutize = (u: string): string => {
+				try { return new URL(u, base).toString(); } catch { return u; }
+			};
+
+			// 1) JSON-LD VideoObject
+			const ldScripts = Array.from(html.matchAll(/<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi));
+			for (const m of ldScripts) {
+				try {
+					const json = JSON.parse(m[1]);
+					const objs = Array.isArray(json) ? json : [json];
+					for (const obj of objs) {
+						const type = (obj['@type'] || obj['type'] || '').toString().toLowerCase();
+						if (type.includes('videoobject')) {
+							const candidate = obj['contentUrl'] || obj['embedUrl'] || obj['url'];
+							if (candidate && typeof candidate === 'string') {
+								const direct = absolutize(candidate);
+								if (/\.(mp4|webm|mov|m3u8|mpd)(\?|#|$)/i.test(direct)) return direct;
+							}
+						}
+					}
+				} catch {}
+			}
+
+			// 2) OpenGraph/Twitter video
+			const ogVideo = (html.match(/property=["']og:video["']\s+content=["']([^"']+)["']/i) || html.match(/content=["']([^"']+)["']\s+property=["']og:video["']/i))?.[1];
+			if (ogVideo) {
+				const direct = absolutize(ogVideo);
+				if (/\.(mp4|webm|mov|m3u8|mpd)(\?|#|$)/i.test(direct)) return direct;
+			}
+
+			// 3) <video> and <source> tags
+			const videoSrcs: string[] = [];
+			for (const m of html.matchAll(/<video[^>]*src=["']([^"']+)["'][^>]*>/gi)) { videoSrcs.push(absolutize(m[1])); }
+			for (const m of html.matchAll(/<source[^>]*type=["']video\/(mp4|webm|ogg)["'][^>]*src=["']([^"']+)["'][^>]*>/gi)) { videoSrcs.push(absolutize(m[2])); }
+			for (const m of html.matchAll(/<source[^>]*src=["']([^"']+\.(?:mp4|webm|mov|m3u8|mpd))(?:\?[^"']*)?["'][^>]*>/gi)) { videoSrcs.push(absolutize(m[1])); }
+			if (videoSrcs.length > 0) {
+				// Prefer mp4/webm, then m3u8/mpd
+				const preferred = [...videoSrcs].sort((a, b) => {
+					const score = (u: string) => (/\.mp4(\?|#|$)/i.test(u) ? 3 : /\.webm(\?|#|$)/i.test(u) ? 2 : /\.(m3u8|mpd)(\?|#|$)/i.test(u) ? 1 : 0);
+					return score(b) - score(a);
+				});
+				for (const u of preferred) {
+					try { const head = await axios.head(u, { timeout: 3000, headers: { 'User-Agent': 'Mozilla/5.0' } }); if (head.status < 400) return u; } catch {}
+				}
+			}
+
+			// 4) Heuristic: absolute links to common video extensions in page text
+			const linkMatches = Array.from(html.matchAll(/https?:[^\s"'<>]+\.(?:mp4|webm|mov|m3u8|mpd)(?:\?[^\s"'<>]*)?/gi)).map(m => absolutize(m[0]));
+			for (const u of linkMatches) {
+				try { const head = await axios.head(u, { timeout: 3000, headers: { 'User-Agent': 'Mozilla/5.0' } }); if (head.status < 400) return u; } catch {}
+			}
+
+			// If nothing found, return original
+			return rawUrl;
+		} catch {
+			return rawUrl;
+		}
+	}
 
   private async resolveImgurUrl(url: string): Promise<string> {
     try {
@@ -640,6 +786,224 @@ export class FilesService {
     } catch (error) {
       console.error('Error resolving Imgur URL:', error);
       throw new Error(`Failed to resolve Imgur URL: ${error.message}`);
+    }
+  }
+
+  private async resolveRedditUrl(rawUrl: string): Promise<string> {
+    try {
+      const ensureDirectFromVReddit = async (id: string): Promise<string> => {
+        const candidates = [
+          `https://v.redd.it/${id}/DASH_1080.mp4`,
+          `https://v.redd.it/${id}/DASH_720.mp4`,
+          `https://v.redd.it/${id}/DASH_480.mp4`,
+          `https://v.redd.it/${id}/DASH_360.mp4`,
+          `https://v.redd.it/${id}/DASH_240.mp4`,
+        ];
+        for (const c of candidates) {
+          try {
+            const resp = await axios.head(c, { timeout: 2500, headers: { 'User-Agent': 'Mozilla/5.0' } });
+            if (resp.status >= 200 && resp.status < 400) return c;
+          } catch {}
+        }
+        return `https://v.redd.it/${id}/HLSPlaylist.m3u8`;
+      };
+
+      const extractFromJson = (json: any): string | undefined => {
+        try {
+          const root = Array.isArray(json) ? (json[0]?.data?.children?.[0]?.data ?? {}) : json?.data?.children?.[0]?.data ?? json;
+          const cp = (root.crosspost_parent_list && root.crosspost_parent_list[0]) || {};
+          // Prefer Redgifs from oEmbed html if present (often contains sound-ready media)
+          const oembedHtml: string | undefined = root.secure_media?.oembed?.html || cp.secure_media?.oembed?.html;
+          if (oembedHtml && /redgifs\.com/i.test(oembedHtml)) {
+            const m = oembedHtml.match(/src=["']([^"']+redgifs\.com[^"']+)["']/i) || oembedHtml.match(/href=["']([^"']+redgifs\.com[^"']+)["']/i);
+            const embed = m?.[1];
+            if (embed) return embed;
+          }
+          const rv = root.secure_media?.reddit_video?.fallback_url || root.preview?.reddit_video_preview?.fallback_url || cp.secure_media?.reddit_video?.fallback_url || cp.preview?.reddit_video_preview?.fallback_url;
+          if (rv && typeof rv === 'string') return rv;
+          const overridden = root.url_overridden_by_dest || root.url;
+          if (typeof overridden === 'string' && overridden) return overridden;
+          // Gallery support
+          if (root.is_gallery && root.gallery_data && root.media_metadata) {
+            try {
+              const firstId = root.gallery_data.items?.[0]?.media_id;
+              const meta = firstId ? root.media_metadata[firstId] : undefined;
+              let galleryUrl = meta?.s?.u || meta?.s?.gif;
+              // Fallback to highest available preview if source missing
+              if (!galleryUrl && Array.isArray(meta?.p) && meta.p.length > 0) {
+                galleryUrl = meta.p[meta.p.length - 1]?.u;
+              }
+              if (galleryUrl && typeof galleryUrl === 'string') return String(galleryUrl).replace(/&amp;/g, '&');
+            } catch {}
+          }
+          // Image preview
+          const img = root.preview?.images?.[0]?.source?.url;
+          if (img && typeof img === 'string') return img.replace(/&amp;/g, '&');
+          // oEmbed thumbnail (may be image)
+          const thumb = root.secure_media?.oembed?.thumbnail_url || cp.secure_media?.oembed?.thumbnail_url;
+          if (thumb && typeof thumb === 'string') return String(thumb);
+        } catch {}
+        return undefined;
+      };
+
+      // Normalize and follow redirects for share links
+      let workingUrl = rawUrl;
+      try {
+        const u0 = new URL(rawUrl);
+        if (u0.hostname.toLowerCase() === 'redd.it' && u0.pathname.length > 1) {
+          const id = u0.pathname.replace(/\//g, '');
+          workingUrl = `https://www.reddit.com/comments/${id}`;
+        }
+        // Strip tracking query params for reddit links (share_id, utm_*) as they can break resolution
+        if (u0.hostname.toLowerCase().includes('reddit.com')) {
+          const clean = new URL(rawUrl);
+          clean.search = '';
+          clean.hash = '';
+          workingUrl = clean.toString();
+        }
+      } catch {}
+
+      // Fetch page to capture canonical URL or final redirected URL (for /s/ share links)
+      const pageResp = await axios.get(workingUrl, { 
+        timeout: 8000, 
+        headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8' }, 
+        maxRedirects: 10, 
+        validateStatus: (s) => !!s && s < 500 
+      });
+      const finalHtml = String(pageResp.data || '');
+      const findMeta = (pattern: RegExp) => { const m = finalHtml.match(pattern); return (m && m[1]) ? m[1] : undefined; };
+      const redirectedUrl: string | undefined = (pageResp as any)?.request?.res?.responseUrl || (pageResp as any)?.request?.responseURL;
+      let canonical = findMeta(/<link[^>]+rel=["']canonical["'][^>]+href=["']([^"']+)["'][^>]*>/i) || findMeta(/property=["']og:url["']\s+content=["']([^"']+)["']/i) || redirectedUrl;
+      // Clean canonical by removing query/hash
+      if (canonical) {
+        try { const c = new URL(canonical); c.search = ''; c.hash = ''; canonical = c.toString(); } catch {}
+      }
+
+      // Try JSON API for post metadata
+      let postJsonUrl: string | undefined;
+      try {
+        if (canonical) {
+          const base = canonical.endsWith('/') ? canonical.slice(0, -1) : canonical;
+          postJsonUrl = `${base}.json?raw_json=1`;
+        } else {
+          const u = new URL(workingUrl);
+          // Ensure no query/hash when deriving id
+          u.search = '';
+          u.hash = '';
+          const parts = u.pathname.split('/').filter(Boolean);
+          // /r/<sub>/comments/<id>/...
+          const idx = parts.findIndex(p => p === 'comments');
+          if (idx >= 0 && parts.length > idx + 1) {
+            const id = parts[idx + 1];
+            postJsonUrl = `https://www.reddit.com/comments/${id}.json?raw_json=1`;
+          }
+        }
+      } catch {}
+
+      if (postJsonUrl) {
+        // TODO: Migrate to OAuth-based Reddit API and add robust rate-limit handling.
+        // The .json endpoint is undocumented and may be rate limited or change behavior.
+        // Implement retry/backoff, caching, and fallbacks to HTML/OG tags when the JSON call fails.
+        // Try multiple hosts for JSON to reduce transient failures
+        const jsonCandidates: string[] = [];
+        try {
+          const urlObj = new URL(postJsonUrl);
+          const path = urlObj.pathname + (urlObj.search || '');
+          jsonCandidates.push(postJsonUrl);
+          jsonCandidates.push(`https://api.reddit.com${path.replace(/\.json$/, '')}`);
+          jsonCandidates.push(`https://old.reddit.com${urlObj.pathname}.json?raw_json=1`);
+        } catch { jsonCandidates.push(postJsonUrl); }
+        for (const endpoint of jsonCandidates) {
+          try {
+            const j = await axios.get(endpoint, { timeout: 8000, headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json' } });
+            let mediaUrl = extractFromJson(j.data);
+            if (mediaUrl) {
+              // Normalize redgifs URLs by stripping embed params to prefer direct media with audio
+              try {
+                const mu = new URL(mediaUrl);
+                if (mu.hostname.endsWith('redgifs.com')) { mu.search = ''; mu.hash = ''; mediaUrl = mu.toString(); }
+              } catch {}
+              try {
+                const v = new URL(mediaUrl);
+                const host = v.hostname.toLowerCase();
+                if (host === 'v.redd.it') {
+                  const id = v.pathname.split('/').filter(Boolean)[0] || '';
+                  if (id) return await ensureDirectFromVReddit(id);
+                }
+              } catch {}
+              if (mediaUrl.endsWith('.gifv')) return mediaUrl.replace(/\.gifv$/i, '.mp4');
+              // Prefer non-silent variants for Redgifs direct links
+              try {
+                const u = new URL(mediaUrl);
+                if (u.hostname.endsWith('redgifs.com')) {
+                  const nonSilent = mediaUrl.replace(/-silent(\.[a-z0-9]+)$/i, '$1');
+                  if (nonSilent !== mediaUrl) {
+                    try {
+                      const head = await axios.head(nonSilent, { timeout: 4000, headers: { 'User-Agent': 'Mozilla/5.0' } });
+                      if (head.status >= 200 && head.status < 400) return nonSilent;
+                    } catch {}
+                  }
+                }
+              } catch {}
+              try { return await this.resolveMediaUrl(mediaUrl); } catch { return mediaUrl; }
+            }
+          } catch {}
+        }
+      }
+
+      // Fallbacks: i.redd.it or v.redd.it direct inference
+      try {
+        const u = new URL(canonical || workingUrl);
+        const host = u.hostname.toLowerCase();
+        const parts = u.pathname.split('/').filter(Boolean);
+        if (host === 'i.redd.it') return u.toString();
+        if (host === 'v.redd.it' && parts.length > 0) {
+          return await ensureDirectFromVReddit(parts[0]);
+        }
+      } catch {}
+
+      // As a last HTML fallback, try og:video/og:image
+      const ogVideo = findMeta(/property=["']og:video["']\s+content=["']([^"']+)["']/i) || findMeta(/content=["']([^"']+)["']\s+property=["']og:video["']/i) || findMeta(/property=["']og:video:secure_url["']\s+content=["']([^"']+)["']/i);
+      if (ogVideo) {
+        try {
+          const vu = new URL(ogVideo);
+          const host = vu.hostname.toLowerCase();
+          if (host === 'v.redd.it') {
+            return await ensureDirectFromVReddit(vu.pathname.split('/').filter(Boolean)[0] || '');
+          }
+          // For non-Reddit hosts (e.g., Redgifs), resolve to direct media (prefer audio-capable variants)
+          try { return await this.resolveMediaUrl(vu.toString()); } catch { return ogVideo; }
+        } catch {}
+        return ogVideo;
+      }
+
+      // Fallback: search for Redgifs embeds in HTML and resolve
+      const redgifsIframe = (finalHtml.match(/<iframe[^>]+src=["']([^"']+redgifs\.com[^"']+)["'][^>]*>/i) || [])[1];
+      if (redgifsIframe) {
+        try {
+          const cleaned = redgifsIframe.replace(/-silent(\.[a-z0-9]+)$/i, '$1');
+          return await this.resolveMediaUrl(cleaned);
+        } catch {}
+      }
+      const redgifsSource = (finalHtml.match(/<source[^>]+src=["']([^"']+redgifs\.com[^"']+)["'][^>]*>/i) || [])[1];
+      if (redgifsSource) {
+        try {
+          const cleaned = redgifsSource.replace(/-silent(\.[a-z0-9]+)$/i, '$1');
+          return await this.resolveMediaUrl(cleaned);
+        } catch {}
+      }
+      const redgifsAnchor = (finalHtml.match(/<a[^>]+href=["']([^"']+redgifs\.com[^"']+)["'][^>]*>/i) || [])[1];
+      if (redgifsAnchor) {
+        try {
+          const cleaned = redgifsAnchor.replace(/-silent(\.[a-z0-9]+)$/i, '$1');
+          return await this.resolveMediaUrl(cleaned);
+        } catch {}
+      }
+      const ogImage = findMeta(/property=["']og:image["']\s+content=["']([^"']+)["']/i) || findMeta(/content=["']([^"']+)["']\s+property=["']og:image["']/i) || findMeta(/name=["']twitter:image["']\s+content=["']([^"']+)["']/i) || findMeta(/content=["']([^"']+)["']\s+name=["']twitter:image["']/i);
+      if (ogImage) return ogImage;
+      return rawUrl;
+    } catch (e) {
+      return rawUrl;
     }
   }
 
@@ -764,13 +1128,41 @@ export class FilesService {
 			})();
 
 			// Race strategies with overall deadline
-			const overall = new Promise<string>((_, reject) => setTimeout(() => reject(new Error('overall deadline exceeded')), MAX_MS));
-			const result = await Promise.race<string>([
-				Promise.any([apiPromise, headPromise, htmlPromise]).catch(() => Promise.reject(new Error('all strategies failed'))),
-				overall,
-			]);
-			log('resolved success', { result, totalMs: Date.now() - startedAt });
-			return result;
+			// Wrap to tag the winner type; enforce overall deadline via withTimeout
+			const taggedApi = apiPromise.then((u) => ({ type: 'api' as const, url: u }));
+			const taggedHead = headPromise.then((u) => ({ type: 'head' as const, url: u }));
+			const taggedHtml = htmlPromise.then((u) => ({ type: 'html' as const, url: u }));
+			const firstTagged = await withTimeout(Promise.any([taggedApi, taggedHead, taggedHtml]), MAX_MS, 'overall');
+			let candidate = firstTagged.url;
+			const winnerType = firstTagged.type;
+			// If API wasn't the winner, allow a short grace for API to arrive and override candidate
+			if (winnerType !== 'api') {
+				try {
+					const apiGrace = await withTimeout(apiPromise, 700, 'apiGrace');
+					if (apiGrace) {
+						candidate = apiGrace;
+					}
+				} catch {}
+			}
+			// Prefer non-silent direct media if candidate is a Redgifs silent URL
+			try {
+				const cu = new URL(candidate);
+				if (cu.hostname.toLowerCase() === 'media.redgifs.com' && /-silent\.mp4$/i.test(cu.pathname)) {
+					const nonSilent = candidate.replace(/-silent(\.mp4)$/i, '$1');
+					try {
+						const head = await withTimeout(
+							axios.head(nonSilent, { timeout: HEAD_TIMEOUT, headers: { 'User-Agent': 'Mozilla/5.0', Referer: 'https://www.redgifs.com/' } }),
+							HEAD_TIMEOUT + 200,
+							'head nonSilent',
+						);
+						if (head.status >= 200 && head.status < 400) {
+							candidate = nonSilent;
+						}
+					} catch {}
+				}
+			} catch {}
+			log('resolved success', { result: candidate, totalMs: Date.now() - startedAt });
+			return candidate;
 		} catch (err) {
 			log('resolve failed, falling back to original', (err as any)?.message || err, { totalMs: Date.now() - startedAt });
 			return rawUrl;
