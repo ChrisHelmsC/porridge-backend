@@ -40,10 +40,8 @@ export class FilesController {
 				...result,
 			};
 		} catch (error) {
-			throw new HttpException(
-				'Failed to upload file',
-				HttpStatus.INTERNAL_SERVER_ERROR,
-			);
+			if (error instanceof HttpException) { throw error; }
+			throw new HttpException('Failed to upload file', HttpStatus.INTERNAL_SERVER_ERROR);
 		}
 	}
 
@@ -58,10 +56,8 @@ export class FilesController {
 				...result,
 			};
 		} catch (error) {
-			throw new HttpException(
-				'Failed to download and upload file from URL',
-				HttpStatus.INTERNAL_SERVER_ERROR,
-			);
+			if (error instanceof HttpException) { throw error; }
+			throw new HttpException('Failed to download and upload file from URL', HttpStatus.INTERNAL_SERVER_ERROR);
 		}
 	}
 

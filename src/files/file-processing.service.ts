@@ -16,6 +16,7 @@ export interface FileProcessingResult {
   thumbnailPath?: string; // Path to generated thumbnail
   width?: number;
   height?: number;
+  hasAudio?: boolean;
 }
 
 @Injectable()
@@ -38,10 +39,19 @@ export class FileProcessingService {
       // Probe dimensions for videos and images
       let width: number | undefined;
       let height: number | undefined;
+      let hasAudio: boolean | undefined;
       try {
         const dim = this.probeDimensions(filePath, mimeType);
         width = dim?.width;
         height = dim?.height;
+      } catch {}
+
+      try {
+        if (mimeType?.startsWith('video/')) {
+          hasAudio = this.probeHasAudio(filePath);
+        } else {
+          hasAudio = false;
+        }
       } catch {}
 
       // Generate thumbnail for videos and GIFs
@@ -70,6 +80,7 @@ export class FileProcessingService {
         thumbnailPath,
         width,
         height,
+        hasAudio,
       };
     } catch (error) {
       console.error('Error processing file:', error);
@@ -192,6 +203,21 @@ export class FileProcessingService {
       if (isFinite(w) && isFinite(h) && w > 0 && h > 0) return { width: w, height: h };
     } catch {}
     return undefined;
+  }
+
+  private probeHasAudio(filePath: string): boolean {
+    try {
+      // Count audio streams; if at least one, we consider it has audio
+      const out = child_process.execSync(
+        `ffprobe -v error -select_streams a -show_entries stream=index -of csv=p=0 "${filePath}"`,
+        { encoding: 'utf8' }
+      ).trim();
+      if (!out) return false;
+      // Any numeric index indicates at least one audio stream
+      return /\d/.test(out);
+    } catch {
+      return false;
+    }
   }
 
   async generateVideoThumbnail(videoPath: string): Promise<string> {

@@ -304,6 +304,7 @@ export class FilesService {
 				record.state = 'uploading';
 				if (!record.totalBytes) record.totalBytes = stats.size;
 
+				// Derive a sensible content-type from extension for S3 upload
 				const uploadContentType = this.getMimeTypeFromExtension(urlExt) || 'application/octet-stream';
 				const s3Key = `${fileId}${urlExt}`;
 				await this.s3Service.uploadFile(tempFilePath, s3Key, uploadContentType, (bytes) => { record.uploadedBytes = bytes; });
@@ -336,7 +337,10 @@ export class FilesService {
     const fileExtension = path.extname(file.originalname);
     const filename = `${fileId}${fileExtension}`;
 
-		const uploadContentType = file.mimetype || this.getMimeTypeFromExtension(path.extname(file.originalname)) || 'application/octet-stream';
+		// Prefer a real MIME type; ignore generic octet-stream and fall back to extension
+		const isGeneric = !file.mimetype || file.mimetype === 'application/octet-stream' || file.mimetype === 'binary/octet-stream';
+		const byExt = this.getMimeTypeFromExtension(path.extname(file.originalname));
+		const uploadContentType = isGeneric ? (byExt || 'application/octet-stream') : file.mimetype;
 
 		// Quick duplicate check by combined hash before S3 upload
 		const quick = await this.computeQuickCombinedHash(file.path);
@@ -347,7 +351,14 @@ export class FilesService {
 		}
 
 		// Upload media to S3 first
-    const s3Url = await this.s3Service.uploadFile(file.path, filename, uploadContentType);
+    let s3Url: string;
+    try {
+      s3Url = await this.s3Service.uploadFile(file.path, filename, uploadContentType);
+    } catch (e: any) {
+      console.error('[files] S3 upload failed:', e?.message || e);
+      try { fs.unlinkSync(file.path); } catch {}
+      throw new Error('S3 upload failed');
+    }
 
 		// Generate thumbnail synchronously for immediate availability
     let thumbnailUrl: string | undefined;
@@ -386,7 +397,13 @@ export class FilesService {
 			transcodeStatus: (uploadContentType === 'video/webm') ? 'pending' : null,
     });
 
-    const savedFile = await this.fileRepository.save(fileEntity);
+    let savedFile;
+    try {
+      savedFile = await this.fileRepository.save(fileEntity);
+    } catch (e: any) {
+      console.error('[files] DB save failed:', e?.message || e);
+      throw new Error('DB save failed');
+    }
 
 		// Background processing (fire-and-forget)
 		(async () => {
@@ -409,6 +426,7 @@ export class FilesService {
 					size: processing.size || savedFile.size,
           ...(processing.width ? { width: processing.width } : {}),
           ...(processing.height ? { height: processing.height } : {}),
+					...(typeof processing.hasAudio === 'boolean' ? { hasAudio: processing.hasAudio } : {}),
 				});
 
 				// Transcode WEBM to MP4 for mobile compatibility
@@ -430,7 +448,7 @@ export class FilesService {
 				const withFp = await this.computeAndStoreFingerprints(file.path, { ...savedFile });
 				await this.fileRepository.update(savedFile.id, {
 					durationMs: withFp.durationMs ?? null,
-					hasAudio: withFp.hasAudio,
+					hasAudio: (typeof withFp.hasAudio === 'boolean') ? withFp.hasAudio : (typeof processing.hasAudio === 'boolean' ? processing.hasAudio! : false),
 					audioFingerprint: withFp.audioFingerprint ?? null,
 					frameHashSequence: withFp.frameHashSequence ?? null,
 				});
@@ -467,7 +485,7 @@ export class FilesService {
 			const tempDir = path.join(process.cwd(), 'temp');
 			if (!fs.existsSync(tempDir)) fs.mkdirSync(tempDir, { recursive: true });
 	    const fileId = uuidv4();
-	    const contentType = response.headers['content-type'] || 'application/octet-stream';
+	    let contentType = response.headers['content-type'] || 'application/octet-stream';
 	    const urlExt = path.extname(new URL(mediaUrl).pathname);
 	    const headerExt = this.getExtensionFromMimeType(contentType);
 	    const fileExtension = headerExt || urlExt || '.bin';
@@ -478,13 +496,41 @@ export class FilesService {
 	    const stats = fs.statSync(tempFilePath);
 	    const originalName = path.basename(new URL(mediaUrl).pathname) || `download${fileExtension}`;
 	    let effectiveMimeType = contentType;
+			// If server returned generic MIME, prefer extension-based detection
 			if (!headerExt && urlExt) { effectiveMimeType = this.getMimeTypeFromExtension(urlExt) || contentType; }
 			const mockFile: Express.Multer.File = { fieldname: 'file', originalname: originalName, encoding: '7bit', mimetype: effectiveMimeType, size: stats.size, destination: tempDir, filename: `${fileId}${fileExtension}`, path: tempFilePath, buffer: Buffer.alloc(0), stream: null as any };
 			return await this.uploadFile(mockFile, ownerId, url, tags);
-    } catch (error) {
-      throw new Error(`Failed to download file from URL: ${error.message}`);
-    }
-  }
+	    
+	    // Fallback: try to get a preview image (og:image/twitter:image) and save that, preserving user's URL as sourceUrl
+		} catch (error) {
+			try {
+				const pageResp = await axios.get(url, { headers: { 'User-Agent': 'Mozilla/5.0' }, timeout: 8000 });
+				const html = String(pageResp.data || '');
+				const og = html.match(/property=["']og:image["']\s+content=["']([^"']+)["']/i) || html.match(/content=["']([^"']+)["']\s+property=["']og:image["']/i);
+				const tw = html.match(/name=["']twitter:image["']\s+content=["']([^"']+)["']/i) || html.match(/content=["']([^"']+)["']\s+name=["']twitter:image["']/i);
+				const previewUrl: string | undefined = (og?.[1] || tw?.[1]) as string | undefined;
+				if (!previewUrl) throw new Error('No preview image found');
+				const polite = this.buildPoliteHeaders(previewUrl);
+				const img = await this.fetchStreamWithBackoff(previewUrl, polite, 2);
+				const tempDir = path.join(process.cwd(), 'temp');
+				if (!fs.existsSync(tempDir)) fs.mkdirSync(tempDir, { recursive: true });
+				const fileId = uuidv4();
+				const ext = path.extname(new URL(previewUrl).pathname) || '.jpg';
+				const tempFilePath = path.join(tempDir, `${fileId}${ext}`);
+				const writer = fs.createWriteStream(tempFilePath);
+				img.data.pipe(writer);
+				await new Promise<void>((resolve, reject) => { writer.on('finish', () => resolve()); writer.on('error', reject); });
+				const stats = fs.statSync(tempFilePath);
+				if (stats.size === 0) throw new Error('Preview image download empty');
+				const contentType = img.headers['content-type'] || this.getMimeTypeFromExtension(ext) || 'image/jpeg';
+				const originalName = path.basename(new URL(previewUrl).pathname) || `preview${ext}`;
+				const mockFile: Express.Multer.File = { fieldname: 'file', originalname: originalName, encoding: '7bit', mimetype: contentType, size: stats.size, destination: tempDir, filename: path.basename(tempFilePath), path: tempFilePath, buffer: Buffer.alloc(0), stream: null as any };
+				return await this.uploadFile(mockFile, ownerId, url, tags);
+			} catch (fallbackErr: any) {
+				throw new Error(`Failed to download file from URL: ${ (error as any)?.message || error }; preview fallback failed: ${fallbackErr?.message || fallbackErr}`);
+			}
+		}
+	}
 
 	async getAllFiles(ownerId: string): Promise<FileRecord[]> {
 		const files = await this.fileRepository.find({ where: { ownerId }, order: { uploadedAt: 'DESC' } });

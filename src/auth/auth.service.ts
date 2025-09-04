@@ -12,16 +12,16 @@ export class AuthService {
 		private readonly config: ConfigService,
 	) {}
 
-	async validateUser(username: string, password: string) {
-		const user = await this.usersService.findByUsername(username);
+	async validateUser(email: string, password: string) {
+		const user = await this.usersService.findByEmail(email);
 		if (!user) throw new UnauthorizedException('Invalid credentials');
 		const match = await bcrypt.compare(password, user.passwordHash);
 		if (!match) throw new UnauthorizedException('Invalid credentials');
 		return user;
 	}
 
-	async login(user: { id: string; username: string; tokenVersion?: number }) {
-		const payload = { sub: user.id, username: user.username, tokenVersion: user.tokenVersion ?? 0 } as any;
+	async login(user: { id: string; email: string; tokenVersion?: number }) {
+		const payload = { sub: user.id, email: user.email, tokenVersion: user.tokenVersion ?? 0 } as any;
 		const accessExpiresIn = this.config.get<string>('JWT_ACCESS_EXPIRES_IN') || '15m';
 		const refreshExpiresIn = this.config.get<string>('JWT_REFRESH_EXPIRES_IN') || '30d';
 		const access_token = await this.jwtService.signAsync(payload, { expiresIn: accessExpiresIn });
@@ -42,7 +42,7 @@ export class AuthService {
 		const refreshExpiresIn = this.config.get<string>('JWT_REFRESH_EXPIRES_IN') || '30d';
 		const user = await this.usersService.findById(userId);
 		if (!user) throw new UnauthorizedException('User not found');
-		const payload = { sub: user.id, username: user.username, tokenVersion } as any;
+		const payload = { sub: user.id, email: user.email, tokenVersion } as any;
 		const access_token = await this.jwtService.signAsync(payload, { expiresIn: accessExpiresIn });
 		const refreshPayload = { sub: user.id, tokenVersion, jti: await bcrypt.genSalt(6) };
 		const refresh_token = await this.jwtService.signAsync(refreshPayload, { expiresIn: refreshExpiresIn });

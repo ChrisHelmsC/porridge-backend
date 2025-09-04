@@ -1,4 +1,4 @@
-import { Body, Controller, Post, Request, UseGuards, Res, Get, HttpCode, Req, UnauthorizedException } from '@nestjs/common';
+import { Body, Controller, Post, Request, UseGuards, Res, Get, HttpCode, Req, UnauthorizedException, BadRequestException } from '@nestjs/common';
 import { AuthService } from './auth.service';
 import { LocalAuthGuard } from './local.guard';
 import { UsersService } from '../users/users.service';
@@ -9,8 +9,8 @@ import { JwtAuthGuard } from './jwt.guard';
 class SignupDto {
 	@IsString()
 	@MinLength(3)
-	@MaxLength(32)
-	username: string;
+	@MaxLength(128)
+	email: string;
 
 	@IsString()
 	@MinLength(6)
@@ -20,7 +20,7 @@ class SignupDto {
 
 class LoginDto {
 	@IsString()
-	username: string;
+	email: string;
 
 	@IsString()
 	password: string;
@@ -35,8 +35,9 @@ export class AuthController {
 
 	@Post('signup')
 	async signup(@Body() body: SignupDto, @Res({ passthrough: true }) res: Response) {
-		const user = await this.usersService.createUser(body.username, body.password);
-		const tokens = await this.authService.login({ id: user.id, username: user.username, tokenVersion: user.tokenVersion });
+		if (!body.email.includes('@')) throw new BadRequestException('Email is invalid');
+		const user = await this.usersService.createUser(body.email, body.password);
+		const tokens = await this.authService.login({ id: user.id, email: user.email, tokenVersion: user.tokenVersion });
 		res.cookie('access_token', tokens.access_token, { httpOnly: true, sameSite: 'lax', secure: false });
 		res.cookie('refresh_token', tokens.refresh_token, { httpOnly: true, sameSite: 'lax', secure: false });
 		return { message: 'signed_in' };
@@ -46,7 +47,7 @@ export class AuthController {
 	@Post('login')
 	@HttpCode(200)
 	async login(@Request() req: any, @Body() _body: LoginDto, @Res({ passthrough: true }) res: Response) {
-		const tokens = await this.authService.login({ id: req.user.id, username: req.user.username, tokenVersion: req.user.tokenVersion ?? 0 });
+		const tokens = await this.authService.login({ id: req.user.id, email: req.user.email, tokenVersion: req.user.tokenVersion ?? 0 });
 		res.cookie('access_token', tokens.access_token, { httpOnly: true, sameSite: 'lax', secure: false });
 		res.cookie('refresh_token', tokens.refresh_token, { httpOnly: true, sameSite: 'lax', secure: false });
 		return { message: 'signed_in' };
@@ -55,7 +56,7 @@ export class AuthController {
 	@UseGuards(JwtAuthGuard)
 	@Get('me')
 	async me(@Request() req: any) {
-		return { id: req.user.userId, username: req.user.username };
+		return { id: req.user.userId, email: req.user.email };
 	}
 
 	@Post('logout')

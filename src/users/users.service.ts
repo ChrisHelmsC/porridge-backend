@@ -11,18 +11,18 @@ export class UsersService {
 		private readonly usersRepo: Repository<UserEntity>,
 	) {}
 
-	async createUser(username: string, password: string): Promise<UserEntity> {
-		const existing = await this.usersRepo.findOne({ where: { username } });
+	async createUser(email: string, password: string): Promise<UserEntity> {
+		const existing = await this.usersRepo.findOne({ where: { email } });
 		if (existing) {
-			throw new ConflictException('Username already taken');
+			throw new ConflictException('Email already taken');
 		}
 		const passwordHash = await bcrypt.hash(password, 10);
-		const user = this.usersRepo.create({ username, passwordHash });
+		const user = this.usersRepo.create({ email, passwordHash });
 		return this.usersRepo.save(user);
 	}
 
-	findByUsername(username: string): Promise<UserEntity | null> {
-		return this.usersRepo.findOne({ where: { username } });
+	findByEmail(email: string): Promise<UserEntity | null> {
+		return this.usersRepo.findOne({ where: { email } });
 	}
 
 	findById(id: string): Promise<UserEntity | null> {
