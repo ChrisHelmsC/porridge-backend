@@ -692,6 +692,9 @@ export class FilesService {
     if (url.includes('reddit.com') || url.includes('redd.it')) {
       return await this.resolveRedditUrl(url);
     }
+    if (url.includes('twitter.com') || url.includes('x.com')) {
+      return await this.resolveTwitterUrl(url);
+    }
 		// Generic fallback: for arbitrary pages, try to discover a direct video URL
 		try {
 			return await this.resolveGenericUrl(url);
@@ -1004,6 +1007,194 @@ export class FilesService {
       return rawUrl;
     } catch (e) {
       return rawUrl;
+    }
+  }
+
+  private async resolveTwitterUrl(rawUrl: string): Promise<string> {
+    const log = (msg: string, ...args: any[]) => console.log(`[Twitter] ${msg}`, ...args);
+    
+    try {
+      // Normalize Twitter URLs - handle both twitter.com and x.com
+      let workingUrl = rawUrl;
+      try {
+        const u = new URL(rawUrl);
+        // Convert x.com to twitter.com for consistency
+        if (u.hostname.toLowerCase() === 'x.com') {
+          u.hostname = 'twitter.com';
+          workingUrl = u.toString();
+        }
+        // Clean up URL by removing unnecessary parameters
+        u.search = '';
+        u.hash = '';
+        workingUrl = u.toString();
+      } catch {}
+
+      // Extract tweet ID from URL
+      const tweetIdMatch = workingUrl.match(/\/status\/(\d+)/);
+      if (!tweetIdMatch) {
+        throw new Error('Could not extract tweet ID from URL');
+      }
+      const tweetId = tweetIdMatch[1];
+      log('Attempting to resolve tweet', { tweetId, workingUrl });
+
+      // Strategy 1: Try Twitter's oEmbed API (most reliable, no auth needed)
+      try {
+        log('Trying oEmbed API...');
+        const oembedUrl = `https://publish.twitter.com/oembed?url=${encodeURIComponent(workingUrl)}`;
+        const oembedResponse = await axios.get(oembedUrl, {
+          timeout: 8000,
+          headers: { 
+            'User-Agent': 'Mozilla/5.0 (compatible; TwitterBot/1.0; +https://help.twitter.com)',
+            'Accept': 'application/json'
+          },
+        });
+        
+        const oembedData = oembedResponse.data;
+        if (oembedData && oembedData.html) {
+          // Extract video URL from oEmbed HTML if present
+          const videoPatterns = [
+            /https:\/\/video\.twimg\.com\/[^"'\s]+\.mp4/g,
+            /https:\/\/video\.twimg\.com\/[^"'\s]+\.m3u8/g,
+          ];
+          
+          for (const pattern of videoPatterns) {
+            const videoMatch = oembedData.html.match(pattern);
+            if (videoMatch && videoMatch[0]) {
+              const videoUrl = videoMatch[0];
+              log('Found video via oEmbed:', videoUrl);
+              return videoUrl;
+            }
+          }
+        }
+        log('oEmbed did not contain video URLs');
+      } catch (error) {
+        log('oEmbed API failed:', error.message);
+      }
+
+      // Strategy 2: Scrape page HTML (backup method)
+      try {
+        log('Trying HTML scraping...');
+        const response = await axios.get(workingUrl, {
+          timeout: 10000,
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+            'Accept-Encoding': 'gzip, deflate',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+          },
+          maxRedirects: 5,
+          validateStatus: (s) => !!s && s < 500,
+        });
+
+        const html = String(response.data || '');
+        log('HTML page fetched, length:', html.length);
+        
+        // Look for various video URL patterns in the HTML
+        const videoPatterns = [
+          // Direct Twitter video URLs
+          { pattern: /https:\/\/video\.twimg\.com\/[^"'\s\)]+\.mp4(?:\?[^"'\s\)]*)?/gi, name: 'twimg mp4' },
+          { pattern: /https:\/\/video\.twimg\.com\/[^"'\s\)]+\.m3u8(?:\?[^"'\s\)]*)?/gi, name: 'twimg m3u8' },
+          // JSON data within scripts
+          { pattern: /"video_url":\s*"([^"]+)"/gi, name: 'json video_url' },
+          { pattern: /"contentUrl":\s*"([^"]+\.mp4[^"]*)"/gi, name: 'json contentUrl' },
+          // OpenGraph and Twitter meta tags
+          { pattern: /property=["']og:video(?::url)?["']\s+content=["']([^"']+)["']/gi, name: 'og:video' },
+          { pattern: /content=["']([^"']+)["']\s+property=["']og:video(?::url)?["']/gi, name: 'og:video reverse' },
+          { pattern: /name=["']twitter:player:stream["']\s+content=["']([^"']+)["']/gi, name: 'twitter:player:stream' },
+          { pattern: /content=["']([^"']+)["']\s+name=["']twitter:player:stream["']/gi, name: 'twitter:player:stream reverse' },
+          // Video elements
+          { pattern: /<video[^>]+src=["']([^"']+)["']/gi, name: 'video src' },
+          { pattern: /<source[^>]+src=["']([^"']+)["']/gi, name: 'source src' },
+        ];
+
+        let foundVideoUrl: string | null = null;
+        
+        for (const { pattern, name } of videoPatterns) {
+          const matches = Array.from(html.matchAll(pattern));
+          log(`Trying pattern ${name}, found ${matches.length} matches`);
+          
+          for (const match of matches) {
+            const candidateUrl = match[1] || match[0];
+            if (candidateUrl && (candidateUrl.includes('.mp4') || candidateUrl.includes('.m3u8'))) {
+              // Clean up the URL
+              let cleanUrl = candidateUrl
+                .replace(/\\u002F/g, '/')
+                .replace(/\\/g, '')
+                .replace(/&amp;/g, '&');
+              
+              // Validate that this looks like a real video URL
+              try {
+                new URL(cleanUrl);
+                log(`Found candidate URL via ${name}:`, cleanUrl);
+                
+                // Prefer MP4 over M3U8 for better compatibility
+                if (cleanUrl.includes('.mp4') || !foundVideoUrl) {
+                  foundVideoUrl = cleanUrl;
+                  if (cleanUrl.includes('.mp4')) {
+                    break; // MP4 is preferred, stop looking
+                  }
+                }
+              } catch {
+                log(`Invalid URL format: ${cleanUrl}`);
+              }
+            }
+          }
+          if (foundVideoUrl && foundVideoUrl.includes('.mp4')) break; // Found MP4, stop searching
+        }
+
+        if (foundVideoUrl) {
+          // Validate the URL is accessible
+          try {
+            log('Validating video URL accessibility...');
+            const headResponse = await axios.head(foundVideoUrl, {
+              timeout: 5000,
+              headers: { 
+                'User-Agent': 'Mozilla/5.0',
+                'Referer': 'https://twitter.com/',
+              },
+            });
+            if (headResponse.status >= 200 && headResponse.status < 400) {
+              log('Successfully resolved and validated video URL:', foundVideoUrl);
+              return foundVideoUrl;
+            } else {
+              log('Video URL returned status:', headResponse.status);
+            }
+          } catch (headError) {
+            log('Video URL validation failed:', headError.message);
+            // Still return the URL even if HEAD request fails - some servers block HEAD
+            log('Returning unvalidated video URL:', foundVideoUrl);
+            return foundVideoUrl;
+          }
+        } else {
+          log('No video URLs found in HTML');
+        }
+      } catch (error) {
+        log('HTML scraping failed:', error.message);
+      }
+
+      // If all strategies failed, fall back to the generic resolver
+      log('All Twitter-specific strategies failed, trying generic resolver...');
+      try {
+        return await this.resolveGenericUrl(workingUrl);
+      } catch (genericError) {
+        log('Generic resolver also failed:', genericError.message);
+      }
+
+      // If everything failed, throw an error
+      throw new Error(`Could not extract video from Twitter post ${tweetId}. This may be due to:
+- The tweet doesn't contain a video
+- The video is restricted or private
+- Twitter's anti-scraping measures are blocking access
+- The tweet may have been deleted`);
+      
+    } catch (error) {
+      console.error('[Twitter] Error resolving Twitter URL:', error.message);
+      throw new Error(`Failed to resolve Twitter URL: ${error.message}`);
     }
   }
 
